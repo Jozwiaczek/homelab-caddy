@@ -8,7 +8,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write # keepalive commit
   packages: write
 
 env:
@@ -38,14 +38,49 @@ jobs:
           full="$(docker run --rm caddy-homelab:test caddy version | awk '{print $1}' | sed 's/^v//')"
           echo "full=$full" >> "$GITHUB_OUTPUT"
           echo "minor=${full%.*}" >> "$GITHUB_OUTPUT"
+      - name: Compare with published image
+        id: diff
+        run: |
+          # Caddy and module versions plus base image layers (all but our binary layer).
+          fingerprint() {
+            docker run --rm --entrypoint sh "$1" -c 'caddy version; caddy list-modules --versions' | grep -v '^[[:space:]]*$'
+            docker image inspect "$1" --format '{{json .RootFS.Layers}}' | jq -c '.[:-1]'
+          }
+          fingerprint caddy-homelab:test > new.txt
+          published="$IMAGE:${{ steps.tags.outputs.minor }}"
+          if docker pull -q "$published" > /dev/null 2>&1; then
+            fingerprint "$published" > old.txt
+          else
+            : > old.txt
+          fi
+          if cmp -s old.txt new.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes since $published, nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            { echo '```diff'; diff old.txt new.txt || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: docker/login-action@v3
+        if: steps.diff.outputs.changed == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push
+        if: steps.diff.outputs.changed == 'true'
         run: |
           for t in "${{ steps.tags.outputs.full }}" "${{ steps.tags.outputs.minor }}"; do
             docker tag caddy-homelab:test "$IMAGE:$t"
             docker push "$IMAGE:$t"
           done
+      # GitHub disables scheduled workflows in public repos after 60 days without activity.
+      - name: Keep schedule alive
+        if: github.event_name == 'schedule'
+        run: |
+          idle_days=$(( ($(date +%s) - $(git log -1 --format=%ct)) / 86400 ))
+          if [ "$idle_days" -ge 50 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive for scheduled builds"
+            git push
+          fi
